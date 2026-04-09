@@ -1,11 +1,11 @@
 """
 Optimized training script for the GPU MODE hackathon.
 
-Self-contained: only requires torch + numpy. No external frameworks.
-  - Llama architecture (RMSNorm, SwiGLU, RoPE, GQA) via model.py
-  - torch.compile with regional compilation on each TransformerBlock
-  - ~970M param model, large per-GPU batch
-  - Fused AdamW, BF16 autocast, DDP
+Tier 1: Gradient accumulation, scaled LR, WSD schedule
+Tier 2: FSDP2 (shards params+optim across GPUs), torch.compile max-autotune
+Tier 3: FP8 via torchao for ~1.3x throughput on B300
+
+Only requires: torch (nightly), numpy, torchao
 """
 
 import os
@@ -18,18 +18,21 @@ from dataclasses import dataclass, asdict
 
 import numpy as np
 import torch
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
+from torch.distributed import init_process_group, destroy_process_group
 
 from model import get_model
 
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Config:
     data_dir:    str   = "/home/data/"
     token_dtype: str   = "uint16"
-    seq_len:     int   = 1024
+    seq_len:     int   = 2048
 
     vocab_size: int   = 32768
     n_layer:    int   = 20
@@ -40,7 +43,7 @@ class Config:
     norm_eps:   float = 1e-5
     rope_theta: float = 10000.0
 
-    batch_size:       int   = 32
+    batch_size:       int   = 64
     grad_accum_steps: int   = 1
     max_lr:           float = 6e-4
     min_lr:           float = 6e-5
@@ -51,8 +54,15 @@ class Config:
     time_limit_seconds: float = 10 * 60
 
     checkpoint_path: str = "checkpoint.pt"
-    compile: bool = True
+    compile:     bool = True
+    compile_mode: str = "default"
+    use_fsdp:    bool = True
+    use_fp8:     bool = False
 
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
 
 class BinDataset:
     def __init__(self, data_dir: str, seq_len: int, dtype: str = "uint16"):
@@ -82,6 +92,10 @@ class BinDataset:
                torch.stack(ys).to(device, non_blocking=True)
 
 
+# ---------------------------------------------------------------------------
+# LR schedule: warmup -> stable -> cosine decay (WSD-like)
+# ---------------------------------------------------------------------------
+
 def get_lr(step: int, cfg: Config) -> float:
     if step < cfg.warmup_steps:
         return cfg.max_lr * (step + 1) / cfg.warmup_steps
@@ -91,27 +105,55 @@ def get_lr(step: int, cfg: Config) -> float:
     return cfg.min_lr + 0.5 * (1.0 + math.cos(math.pi * progress)) * (cfg.max_lr - cfg.min_lr)
 
 
-def save_checkpoint(model, step: int, cfg: Config):
-    raw_model = model.module if hasattr(model, "module") else model
-    torch.save({
-        "step":   step,
-        "model":  raw_model.state_dict(),
-        "config": asdict(cfg),
-    }, cfg.checkpoint_path)
-    print(f"[ckpt] saved -> {cfg.checkpoint_path}  (step {step})")
+# ---------------------------------------------------------------------------
+# Checkpoint (FSDP2-aware)
+# ---------------------------------------------------------------------------
 
+def save_checkpoint(model, step: int, cfg: Config, use_fsdp: bool):
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    if use_fsdp:
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict, StateDictOptions,
+        )
+        sd = get_model_state_dict(
+            model, options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+        )
+    else:
+        raw = model.module if hasattr(model, "module") else model
+        sd = {k: v.cpu() for k, v in raw.state_dict().items()}
+
+    if rank == 0:
+        clean_sd = {}
+        for k, v in sd.items():
+            if isinstance(v, torch.Tensor):
+                clean_sd[k] = v.contiguous()
+        torch.save({
+            "step":   step,
+            "model":  clean_sd,
+            "config": asdict(cfg),
+        }, cfg.checkpoint_path)
+        print(f"[ckpt] saved -> {cfg.checkpoint_path}  (step {step})")
+
+    if dist.is_initialized():
+        dist.barrier()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir",          default="/home/data/")
     parser.add_argument("--checkpoint_path",   default="checkpoint.pt")
-    parser.add_argument("--seq_len",           type=int,   default=1024)
+    parser.add_argument("--seq_len",           type=int,   default=2048)
     parser.add_argument("--vocab_size",        type=int,   default=32768)
     parser.add_argument("--n_layer",           type=int,   default=20)
     parser.add_argument("--n_head",            type=int,   default=16)
     parser.add_argument("--n_kv_head",         type=int,   default=4)
     parser.add_argument("--dim",               type=int,   default=2048)
-    parser.add_argument("--batch_size",        type=int,   default=32)
+    parser.add_argument("--batch_size",        type=int,   default=64)
     parser.add_argument("--grad_accum_steps",  type=int,   default=1)
     parser.add_argument("--max_steps",         type=int,   default=50_000)
     parser.add_argument("--warmup_steps",      type=int,   default=200)
@@ -119,6 +161,10 @@ def main():
     parser.add_argument("--weight_decay",      type=float, default=0.1)
     parser.add_argument("--time_limit_min",    type=float, default=10.0)
     parser.add_argument("--no_compile",        action="store_true")
+    parser.add_argument("--compile_mode",      default="default",
+                        choices=["default", "reduce-overhead", "max-autotune"])
+    parser.add_argument("--no_fsdp",           action="store_true")
+    parser.add_argument("--fp8",               action="store_true")
     args = parser.parse_args()
 
     cfg = Config(
@@ -138,9 +184,12 @@ def main():
         weight_decay       = args.weight_decay,
         time_limit_seconds = args.time_limit_min * 60,
         compile            = not args.no_compile,
+        compile_mode       = args.compile_mode,
+        use_fsdp           = not args.no_fsdp,
+        use_fp8            = args.fp8,
     )
 
-    # ------------------------------------------------------------------ DDP
+    # ------------------------------------------------------------------ Dist
     ddp = int(os.environ.get("RANK", -1)) != -1
     if ddp:
         init_process_group(backend="nccl")
@@ -153,6 +202,7 @@ def main():
     else:
         rank = 0; master = True; world_size = 1
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        cfg.use_fsdp = False
 
     torch.manual_seed(1337 + rank)
     if "cuda" in device:
@@ -166,21 +216,57 @@ def main():
     if master:
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[model] {n_params/1e6:.1f}M parameters  |  "
-              f"dim={cfg.dim} n_layer={cfg.n_layer} n_head={cfg.n_head} n_kv_head={cfg.n_kv_head}")
+              f"dim={cfg.dim} layers={cfg.n_layer} heads={cfg.n_head}/{cfg.n_kv_head}")
 
+    # ---- Tier 3: FP8 via torchao ----
+    if cfg.use_fp8 and "cuda" in device:
+        if master:
+            print("[fp8] converting linear layers to float8 training...")
+        try:
+            from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+            fp8_config = Float8LinearConfig()
+            convert_to_float8_training(model, config=fp8_config)
+            if master:
+                print("[fp8] done")
+        except Exception as e:
+            if master:
+                print(f"[fp8] FAILED: {e} — falling back to BF16")
+            cfg.use_fp8 = False
+
+    # ---- Tier 2b: torch.compile (regional, per-block) ----
     if cfg.compile and "cuda" in device:
         if master:
-            print("[compile] applying torch.compile to each block...")
+            print(f"[compile] mode={cfg.compile_mode}, applying to each block...")
         for key in list(model.layers.keys()):
-            model.layers[key] = torch.compile(model.layers[key])
+            model.layers[key] = torch.compile(
+                model.layers[key], mode=cfg.compile_mode
+            )
         if master:
             print("[compile] done (kernels JIT on first step)")
 
-    if ddp:
+    # ---- Tier 2a: FSDP2 (replaces DDP) ----
+    if cfg.use_fsdp and ddp:
+        if master:
+            print("[fsdp2] applying fully_shard to model...")
+        from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+        )
+        for key in model.layers:
+            fully_shard(model.layers[key], mp_policy=mp_policy)
+        fully_shard(model, mp_policy=mp_policy)
+        if master:
+            print("[fsdp2] done")
+    elif ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
         model = DDP(model, device_ids=[local_rank])
+        if master:
+            print("[ddp] wrapped model in DDP")
 
     # ------------------------------------------------------------------ Optimizer
-    raw_model = model.module if ddp else model
+    raw_model = model
     decay_params   = [p for _, p in raw_model.named_parameters() if p.requires_grad and p.dim() >= 2]
     nodecay_params = [p for _, p in raw_model.named_parameters() if p.requires_grad and p.dim() < 2]
     optimizer = torch.optim.AdamW(
@@ -194,7 +280,11 @@ def main():
 
     tokens_per_step = cfg.batch_size * cfg.seq_len * cfg.grad_accum_steps * world_size
     if master:
-        print(f"[train] {tokens_per_step:,} tokens/step  "
+        mode_str = "FSDP2" if cfg.use_fsdp else "DDP"
+        fp8_str = "+FP8" if cfg.use_fp8 else ""
+        compile_str = f"+compile({cfg.compile_mode})" if cfg.compile else ""
+        print(f"[train] {mode_str}{fp8_str}{compile_str}  |  "
+              f"{tokens_per_step:,} tok/step  "
               f"(bs={cfg.batch_size} x accum={cfg.grad_accum_steps} "
               f"x world={world_size} x seq={cfg.seq_len})")
 
@@ -212,7 +302,7 @@ def main():
         if stop.item():
             if master:
                 print(f"\n[time] {elapsed/60:.1f} min elapsed — time limit reached.")
-                save_checkpoint(model, step, cfg)
+            save_checkpoint(model, step, cfg, cfg.use_fsdp)
             break
 
         step_start = time.time()
@@ -223,8 +313,17 @@ def main():
         accumulated_loss = 0.0
         for micro_step in range(cfg.grad_accum_steps):
             x, y = dataset.get_batch(cfg.batch_size, device)
-            sync_ctx = model.no_sync() if (ddp and micro_step < cfg.grad_accum_steps - 1) \
-                       else nullcontext()
+
+            is_last_micro = (micro_step == cfg.grad_accum_steps - 1)
+
+            if cfg.use_fsdp and cfg.grad_accum_steps > 1:
+                model.set_requires_gradient_sync(is_last_micro)
+                sync_ctx = nullcontext()
+            elif ddp and not is_last_micro:
+                sync_ctx = model.no_sync()
+            else:
+                sync_ctx = nullcontext()
+
             with sync_ctx, amp_ctx:
                 _, loss = model(x, y)
                 loss = loss / cfg.grad_accum_steps
@@ -232,7 +331,10 @@ def main():
             accumulated_loss += loss.item()
 
         if cfg.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            if cfg.use_fsdp:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -252,7 +354,7 @@ def main():
 
     if step >= cfg.max_steps and master:
         print(f"\n[done] Reached max_steps={cfg.max_steps}.")
-        save_checkpoint(model, step, cfg)
+        save_checkpoint(model, step, cfg, cfg.use_fsdp)
 
     if ddp:
         destroy_process_group()
