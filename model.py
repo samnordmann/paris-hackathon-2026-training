@@ -16,7 +16,7 @@ from dataclasses import dataclass
 @dataclass
 class ModelConfig:
     vocab_size: int = 32768
-    seq_len: int = 2048
+    seq_len: int = 1024
     n_layer: int = 20
     n_head: int = 16
     n_kv_head: int = 4

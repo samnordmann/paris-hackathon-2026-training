@@ -35,7 +35,7 @@ from model import get_model
 class Config:
     data_dir:    str   = "/home/data/"
     token_dtype: str   = "uint16"
-    seq_len:     int   = 2048
+    seq_len:     int   = 1024
 
     vocab_size: int   = 32768
     n_layer:    int   = 20
@@ -46,7 +46,7 @@ class Config:
     norm_eps:   float = 1e-5
     rope_theta: float = 10000.0
 
-    batch_size:       int   = 64
+    batch_size:       int   = 128
     grad_accum_steps: int   = 1
     max_lr:           float = 6e-4
     min_lr:           float = 6e-5
