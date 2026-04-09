@@ -36,5 +36,5 @@ srun python -m torch.distributed.run \
         --batch_size    8 \
         --grad_accum_steps 4 \
         --max_steps        5000 \
-        --time_limit_min   10
+        --time_limit_min   
 
