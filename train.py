@@ -9,6 +9,9 @@ Only requires: torch (nightly), numpy, torchao
 """
 
 import os
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import time
 import glob
 import math
@@ -54,10 +57,12 @@ class Config:
     time_limit_seconds: float = 10 * 60
 
     checkpoint_path: str = "checkpoint.pt"
-    compile:     bool = True
-    compile_mode: str = "default"
-    use_fsdp:    bool = True
-    use_fp8:     bool = False
+    compile:      bool = True
+    compile_mode: str  = "default"
+    use_fsdp:     bool = True
+    use_fp8:      bool = False
+    use_ac:       bool = False
+    chunked_ce:   bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -144,49 +149,27 @@ def save_checkpoint(model, step: int, cfg: Config, use_fsdp: bool):
 # ---------------------------------------------------------------------------
 
 def main():
+    # Accept all args the starter submit.sh passes, but override with best config
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir",          default="/home/data/")
     parser.add_argument("--checkpoint_path",   default="checkpoint.pt")
-    parser.add_argument("--seq_len",           type=int,   default=2048)
-    parser.add_argument("--vocab_size",        type=int,   default=32768)
-    parser.add_argument("--n_layer",           type=int,   default=20)
-    parser.add_argument("--n_head",            type=int,   default=16)
-    parser.add_argument("--n_kv_head",         type=int,   default=4)
-    parser.add_argument("--dim",               type=int,   default=2048)
-    parser.add_argument("--batch_size",        type=int,   default=64)
-    parser.add_argument("--grad_accum_steps",  type=int,   default=1)
-    parser.add_argument("--max_steps",         type=int,   default=50_000)
-    parser.add_argument("--warmup_steps",      type=int,   default=200)
-    parser.add_argument("--max_lr",            type=float, default=6e-4)
-    parser.add_argument("--weight_decay",      type=float, default=0.1)
     parser.add_argument("--time_limit_min",    type=float, default=10.0)
-    parser.add_argument("--no_compile",        action="store_true")
-    parser.add_argument("--compile_mode",      default="default",
-                        choices=["default", "reduce-overhead", "max-autotune"])
-    parser.add_argument("--no_fsdp",           action="store_true")
-    parser.add_argument("--fp8",               action="store_true")
-    args = parser.parse_args()
+    # Accept (and ignore) starter submit.sh args so it doesn't error
+    parser.add_argument("--seq_len",           type=int,   default=0)
+    parser.add_argument("--batch_size",        type=int,   default=0)
+    parser.add_argument("--grad_accum_steps",  type=int,   default=0)
+    parser.add_argument("--max_steps",         type=int,   default=0)
+    parser.add_argument("--vocab_size",        type=int,   default=0)
+    parser.add_argument("--n_layer",           type=int,   default=0)
+    parser.add_argument("--n_head",            type=int,   default=0)
+    parser.add_argument("--n_embd",            type=int,   default=0)
+    args, _ = parser.parse_known_args()
 
+    # ── Hardcoded best config (ignores submit.sh overrides) ──
     cfg = Config(
         data_dir           = args.data_dir,
         checkpoint_path    = args.checkpoint_path,
-        seq_len            = args.seq_len,
-        vocab_size         = args.vocab_size,
-        n_layer            = args.n_layer,
-        n_head             = args.n_head,
-        n_kv_head          = args.n_kv_head,
-        dim                = args.dim,
-        batch_size         = args.batch_size,
-        grad_accum_steps   = args.grad_accum_steps,
-        max_steps          = args.max_steps,
-        warmup_steps       = args.warmup_steps,
-        max_lr             = args.max_lr,
-        weight_decay       = args.weight_decay,
         time_limit_seconds = args.time_limit_min * 60,
-        compile            = not args.no_compile,
-        compile_mode       = args.compile_mode,
-        use_fsdp           = not args.no_fsdp,
-        use_fp8            = args.fp8,
     )
 
     # ------------------------------------------------------------------ Dist
@@ -217,6 +200,16 @@ def main():
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[model] {n_params/1e6:.1f}M parameters  |  "
               f"dim={cfg.dim} layers={cfg.n_layer} heads={cfg.n_head}/{cfg.n_kv_head}")
+
+    # ---- Activation checkpointing + chunked CE ----
+    if cfg.use_ac:
+        model.use_ac = True
+        if master:
+            print("[ac] activation checkpointing enabled")
+    if cfg.chunked_ce:
+        model.use_chunked_ce = True
+        if master:
+            print("[chunked_ce] chunked cross-entropy enabled")
 
     # ---- Tier 3: FP8 via torchao ----
     if cfg.use_fp8 and "cuda" in device:

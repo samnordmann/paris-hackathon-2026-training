@@ -1,25 +1,15 @@
 """
-Competition eval model: Llama-like GPT (~950M params).
+Competition eval model: Llama-like GPT (~970M params).
 
-Parameter names match torchtitan's Llama3Model exactly so that
-checkpoints can be loaded without any key remapping.
-
-CONTRACT
---------
-Must expose exactly one function:
-
-    get_model(config: dict) -> torch.nn.Module
-
-The returned model's forward method must have the signature:
-
-    forward(idx: LongTensor[B, T], targets: LongTensor[B, T] | None = None)
-        -> (logits: Tensor[B, T, vocab_size], loss: Tensor | None)
+CONTRACT: get_model(config: dict) -> nn.Module
+          forward(idx, targets=None) -> (logits, loss)
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as ac_checkpoint
 from dataclasses import dataclass
 
 
@@ -62,8 +52,6 @@ def _apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 
 class GQAttention(nn.Module):
-    """Grouped-query attention with separate wq/wk/wv/wo matching torchtitan."""
-
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.n_head = cfg.n_head
@@ -94,8 +82,6 @@ class GQAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """SwiGLU MLP with w1/w2/w3 naming matching torchtitan."""
-
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.w1 = nn.Linear(cfg.dim, cfg.ffn_hidden, bias=False)
@@ -120,6 +106,20 @@ class TransformerBlock(nn.Module):
         return x
 
 
+def _chunked_cross_entropy(hidden: torch.Tensor, weight: torch.Tensor,
+                           targets: torch.Tensor, chunk_size: int = 4096) -> torch.Tensor:
+    """Compute cross-entropy without materializing the full [B*T, vocab] logits."""
+    BT, D = hidden.shape
+    total_loss = torch.zeros(1, device=hidden.device, dtype=torch.float32)
+    for start in range(0, BT, chunk_size):
+        end = min(start + chunk_size, BT)
+        logits_chunk = F.linear(hidden[start:end], weight)
+        total_loss += F.cross_entropy(
+            logits_chunk, targets[start:end], reduction="sum"
+        )
+    return total_loss / BT
+
+
 class LlamaModel(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -139,12 +139,26 @@ class LlamaModel(nn.Module):
             persistent=False,
         )
 
+        self.use_ac = False
+        self.use_chunked_ce = False
+
     def forward(self, idx, targets=None):
-        B, T = idx.shape
         x = self.tok_embeddings(idx)
+
         for layer in self.layers.values():
-            x = layer(x, self.freqs_cis)
+            if self.use_ac and self.training:
+                x = ac_checkpoint(layer, x, self.freqs_cis, use_reentrant=False)
+            else:
+                x = layer(x, self.freqs_cis)
+
         x = self.norm(x)
+
+        if targets is not None and self.use_chunked_ce and self.training:
+            loss = _chunked_cross_entropy(
+                x.view(-1, x.size(-1)), self.output.weight, targets.view(-1)
+            )
+            return x.new_empty(0), loss
+
         logits = self.output(x)
         loss = None
         if targets is not None:
@@ -153,10 +167,6 @@ class LlamaModel(nn.Module):
 
 
 def get_model(config: dict) -> nn.Module:
-    """
-    Instantiate and return the model from a config dict.
-    Called by both train.py (before training) and eval.py (to load a checkpoint).
-    """
     cfg = ModelConfig(
         vocab_size=config.get("vocab_size", 32768),
         seq_len=config.get("seq_len", 2048),
